@@ -1,0 +1,881 @@
+#!/usr/bin/env python3
+"""
+╔═══════════════════════════════════════════════════════════════╗
+║   COSMIC DEFENDER - Terminal Space Battle                     ║
+║   Un juego épico de naves espaciales para la terminal         ║
+╚═══════════════════════════════════════════════════════════════╝
+"""
+
+import curses
+import random
+import time
+import math
+from dataclasses import dataclass, field
+from typing import List, Tuple
+from enum import Enum
+
+# ═══════════════════════════════════════════════════════════════
+# CONFIGURACIÓN Y CONSTANTES
+# ═══════════════════════════════════════════════════════════════
+
+class Colors(Enum):
+    PLAYER = 1
+    ENEMY = 2
+    BULLET = 3
+    POWERUP = 4
+    EXPLOSION = 5
+    STAR = 6
+    UI = 7
+    BOSS = 8
+
+SHIP_ART = [
+    "  /\\  ",
+    " /||\\",
+    "/====\\",
+    "||  ||"
+]
+
+SHIP_ART_POWERED = [
+    "  /\\  ",
+    " /|🔥|\\",
+    "/====\\",
+    "🔥||  ||🔥"
+]
+
+ENEMY_TYPES = {
+    'basic': {
+        'art': ['<○>'],
+        'health': 1,
+        'points': 100,
+        'speed': 0.3
+    },
+    'fast': {
+        'art': ['>>◇>>'],
+        'health': 1,
+        'points': 150,
+        'speed': 0.6
+    },
+    'tank': {
+        'art': ['[===]', ' \\█/ '],
+        'health': 3,
+        'points': 300,
+        'speed': 0.15
+    },
+    'boss': {
+        'art': [
+            '  ╔══════╗  ',
+            ' ╔╝ ◉  ◉ ╚╗ ',
+            '╔╝ ██████ ╚╗',
+            '║ ◄██████► ║',
+            '╚╗ ██████ ╔╝',
+            ' ╚╗ ▼▼▼▼ ╔╝ ',
+            '  ╚══════╝  '
+        ],
+        'health': 50,
+        'points': 5000,
+        'speed': 0.05
+    }
+}
+
+POWERUP_TYPES = {
+    'shield': {'symbol': '🛡', 'color': Colors.POWERUP, 'duration': 300},
+    'rapid': {'symbol': '⚡', 'color': Colors.POWERUP, 'duration': 400},
+    'triple': {'symbol': '◆', 'color': Colors.POWERUP, 'duration': 350},
+    'bomb': {'symbol': '💣', 'color': Colors.POWERUP, 'duration': 0},
+    'life': {'symbol': '❤', 'color': Colors.POWERUP, 'duration': 0}
+}
+
+EXPLOSION_FRAMES = [
+    ['*'],
+    [' * ', '***', ' * '],
+    ['  *  ', ' *** ', '*****', ' *** ', '  *  '],
+    [' . . ', '. . .', ' . . '],
+    ['  .  ', ' . . ', '  .  '],
+    ['  ·  ']
+]
+
+# ═══════════════════════════════════════════════════════════════
+# CLASES DEL JUEGO
+# ═══════════════════════════════════════════════════════════════
+
+@dataclass
+class Particle:
+    x: float
+    y: float
+    vx: float
+    vy: float
+    char: str
+    life: int
+    color: int
+
+@dataclass
+class Star:
+    x: int
+    y: float
+    speed: float
+    char: str
+    brightness: int
+
+@dataclass
+class Bullet:
+    x: float
+    y: float
+    vx: float
+    vy: float
+    damage: int = 1
+    friendly: bool = True
+
+@dataclass
+class Enemy:
+    x: float
+    y: float
+    type: str
+    health: int
+    shoot_cooldown: int = 0
+    move_pattern: int = 0
+    phase: float = 0.0
+
+@dataclass
+class PowerUp:
+    x: float
+    y: float
+    type: str
+
+@dataclass
+class Explosion:
+    x: int
+    y: int
+    frame: int = 0
+    max_frames: int = 6
+
+@dataclass
+class Player:
+    x: float
+    y: float
+    lives: int = 3
+    score: int = 0
+    shield: int = 0
+    rapid_fire: int = 0
+    triple_shot: int = 0
+    invincible: int = 0
+    shoot_cooldown: int = 0
+
+class Game:
+    def __init__(self, stdscr):
+        self.stdscr = stdscr
+        self.setup_curses()
+
+        self.height, self.width = stdscr.getmaxyx()
+        self.player = Player(x=self.width // 2 - 3, y=self.height - 6)
+
+        self.bullets: List[Bullet] = []
+        self.enemies: List[Enemy] = []
+        self.powerups: List[PowerUp] = []
+        self.particles: List[Particle] = []
+        self.explosions: List[Explosion] = []
+        self.stars: List[Star] = []
+
+        self.wave = 1
+        self.wave_timer = 0
+        self.boss_spawned = False
+        self.game_over = False
+        self.paused = False
+        self.frame = 0
+        self.combo = 0
+        self.combo_timer = 0
+        self.shake_frames = 0
+        self.high_score = 0
+
+        self.init_stars()
+
+    def setup_curses(self):
+        curses.start_color()
+        curses.use_default_colors()
+        curses.curs_set(0)
+        self.stdscr.nodelay(True)
+        self.stdscr.keypad(True)
+
+        # Inicializar colores
+        curses.init_pair(Colors.PLAYER.value, curses.COLOR_CYAN, -1)
+        curses.init_pair(Colors.ENEMY.value, curses.COLOR_RED, -1)
+        curses.init_pair(Colors.BULLET.value, curses.COLOR_YELLOW, -1)
+        curses.init_pair(Colors.POWERUP.value, curses.COLOR_GREEN, -1)
+        curses.init_pair(Colors.EXPLOSION.value, curses.COLOR_RED, -1)
+        curses.init_pair(Colors.STAR.value, curses.COLOR_WHITE, -1)
+        curses.init_pair(Colors.UI.value, curses.COLOR_MAGENTA, -1)
+        curses.init_pair(Colors.BOSS.value, curses.COLOR_MAGENTA, -1)
+
+    def init_stars(self):
+        """Crear campo de estrellas parallax"""
+        for _ in range(50):
+            speed = random.uniform(0.1, 0.5)
+            brightness = 1 if speed < 0.2 else (2 if speed < 0.35 else 3)
+            chars = ['.', '·', '*', '✦', '★']
+            self.stars.append(Star(
+                x=random.randint(0, self.width - 1),
+                y=random.uniform(0, self.height),
+                speed=speed,
+                char=random.choice(chars[:brightness + 1]),
+                brightness=brightness
+            ))
+
+    def spawn_enemy(self):
+        """Generar enemigos según la oleada"""
+        if self.wave % 5 == 0 and not self.boss_spawned:
+            # Boss wave
+            self.enemies.append(Enemy(
+                x=self.width // 2 - 6,
+                y=2,
+                type='boss',
+                health=ENEMY_TYPES['boss']['health'] + (self.wave * 5)
+            ))
+            self.boss_spawned = True
+        else:
+            # Enemigos normales
+            enemy_type = random.choices(
+                ['basic', 'fast', 'tank'],
+                weights=[60 - self.wave * 2, 25 + self.wave, 15 + self.wave],
+                k=1
+            )[0]
+
+            art = ENEMY_TYPES[enemy_type]['art']
+            width = len(art[0])
+
+            self.enemies.append(Enemy(
+                x=random.randint(1, self.width - width - 1),
+                y=random.randint(-5, 0),
+                type=enemy_type,
+                health=ENEMY_TYPES[enemy_type]['health'],
+                move_pattern=random.randint(0, 2),
+                phase=random.uniform(0, math.pi * 2)
+            ))
+
+    def spawn_powerup(self, x: int, y: int):
+        """Generar power-up al destruir enemigos"""
+        if random.random() < 0.15:  # 15% chance
+            ptype = random.choice(list(POWERUP_TYPES.keys()))
+            self.powerups.append(PowerUp(x=x, y=y, type=ptype))
+
+    def create_explosion(self, x: int, y: int, intensity: int = 1):
+        """Crear explosión con partículas"""
+        self.explosions.append(Explosion(x=int(x), y=int(y)))
+        self.shake_frames = min(10, intensity * 3)
+
+        # Partículas de explosión
+        for _ in range(intensity * 8):
+            angle = random.uniform(0, math.pi * 2)
+            speed = random.uniform(0.5, 2.0) * intensity
+            self.particles.append(Particle(
+                x=x, y=y,
+                vx=math.cos(angle) * speed,
+                vy=math.sin(angle) * speed * 0.5,
+                char=random.choice(['*', '●', '◦', '○', '·', '+']),
+                life=random.randint(5, 15),
+                color=random.choice([Colors.EXPLOSION.value, Colors.BULLET.value])
+            ))
+
+    def handle_input(self):
+        """Procesar entrada del jugador"""
+        try:
+            key = self.stdscr.getch()
+        except:
+            return True
+
+        if key == ord('q') or key == 27:  # Q o ESC
+            return False
+        elif key == ord('p'):
+            self.paused = not self.paused
+        elif key == ord('r') and self.game_over:
+            self.__init__(self.stdscr)
+            return True
+
+        if self.paused or self.game_over:
+            return True
+
+        move_speed = 2
+
+        # Movimiento
+        if key == curses.KEY_LEFT or key == ord('a'):
+            self.player.x = max(0, self.player.x - move_speed)
+        elif key == curses.KEY_RIGHT or key == ord('d'):
+            self.player.x = min(self.width - 7, self.player.x + move_speed)
+        elif key == curses.KEY_UP or key == ord('w'):
+            self.player.y = max(2, self.player.y - move_speed)
+        elif key == curses.KEY_DOWN or key == ord('s'):
+            self.player.y = min(self.height - 5, self.player.y + move_speed)
+        elif key == ord(' '):  # Disparar
+            self.shoot()
+
+        return True
+
+    def shoot(self):
+        """Disparo del jugador"""
+        if self.player.shoot_cooldown > 0:
+            return
+
+        cooldown = 5 if self.player.rapid_fire > 0 else 12
+        self.player.shoot_cooldown = cooldown
+
+        center_x = self.player.x + 3
+
+        if self.player.triple_shot > 0:
+            # Triple disparo
+            self.bullets.append(Bullet(x=center_x, y=self.player.y - 1, vx=0, vy=-1.5))
+            self.bullets.append(Bullet(x=center_x - 2, y=self.player.y - 1, vx=-0.3, vy=-1.2))
+            self.bullets.append(Bullet(x=center_x + 2, y=self.player.y - 1, vx=0.3, vy=-1.2))
+        else:
+            self.bullets.append(Bullet(x=center_x, y=self.player.y - 1, vx=0, vy=-1.5))
+
+    def enemy_shoot(self, enemy: Enemy):
+        """Disparo de enemigos"""
+        if enemy.shoot_cooldown > 0:
+            return
+
+        art = ENEMY_TYPES[enemy.type]['art']
+        center_x = enemy.x + len(art[0]) // 2
+
+        if enemy.type == 'boss':
+            # Boss dispara múltiples proyectiles
+            for offset in [-3, 0, 3]:
+                self.bullets.append(Bullet(
+                    x=center_x + offset,
+                    y=enemy.y + len(art),
+                    vx=offset * 0.1,
+                    vy=0.8,
+                    friendly=False
+                ))
+            enemy.shoot_cooldown = 30
+        else:
+            self.bullets.append(Bullet(
+                x=center_x,
+                y=enemy.y + len(art),
+                vx=0,
+                vy=0.6,
+                friendly=False
+            ))
+            enemy.shoot_cooldown = random.randint(60, 120)
+
+    def update(self):
+        """Actualizar estado del juego"""
+        if self.paused or self.game_over:
+            return
+
+        self.frame += 1
+
+        # Actualizar timers
+        if self.player.shoot_cooldown > 0:
+            self.player.shoot_cooldown -= 1
+        if self.player.shield > 0:
+            self.player.shield -= 1
+        if self.player.rapid_fire > 0:
+            self.player.rapid_fire -= 1
+        if self.player.triple_shot > 0:
+            self.player.triple_shot -= 1
+        if self.player.invincible > 0:
+            self.player.invincible -= 1
+        if self.combo_timer > 0:
+            self.combo_timer -= 1
+        else:
+            self.combo = 0
+        if self.shake_frames > 0:
+            self.shake_frames -= 1
+
+        # Generar enemigos
+        self.wave_timer += 1
+        spawn_rate = max(30, 100 - self.wave * 5)
+        if self.wave_timer >= spawn_rate and len(self.enemies) < 10 + self.wave:
+            self.spawn_enemy()
+            self.wave_timer = 0
+
+        # Verificar siguiente oleada
+        if not self.enemies and self.wave_timer > 60:
+            self.wave += 1
+            self.boss_spawned = False
+            self.wave_timer = 0
+
+        # Actualizar estrellas (parallax)
+        for star in self.stars:
+            star.y += star.speed
+            if star.y >= self.height:
+                star.y = 0
+                star.x = random.randint(0, self.width - 1)
+
+        # Actualizar balas
+        for bullet in self.bullets[:]:
+            bullet.x += bullet.vx
+            bullet.y += bullet.vy
+
+            if bullet.y < 0 or bullet.y >= self.height or bullet.x < 0 or bullet.x >= self.width:
+                self.bullets.remove(bullet)
+
+        # Actualizar enemigos
+        for enemy in self.enemies[:]:
+            info = ENEMY_TYPES[enemy.type]
+            enemy.phase += 0.05
+
+            # Patrones de movimiento
+            if enemy.move_pattern == 0:  # Recto
+                enemy.y += info['speed']
+            elif enemy.move_pattern == 1:  # Zigzag
+                enemy.y += info['speed']
+                enemy.x += math.sin(enemy.phase) * 0.5
+            elif enemy.move_pattern == 2:  # Circular
+                enemy.y += info['speed'] * 0.7
+                enemy.x += math.sin(enemy.phase) * 0.8
+
+            # Boss se mueve diferente
+            if enemy.type == 'boss':
+                enemy.x = self.width // 2 - 6 + math.sin(enemy.phase * 0.3) * (self.width // 4)
+                if enemy.y < 3:
+                    enemy.y += 0.1
+
+            # Mantener en pantalla
+            art_width = len(info['art'][0])
+            enemy.x = max(0, min(self.width - art_width, enemy.x))
+
+            # Enemigos disparan
+            if enemy.shoot_cooldown > 0:
+                enemy.shoot_cooldown -= 1
+            elif random.random() < 0.02:
+                self.enemy_shoot(enemy)
+
+            # Eliminar si sale de pantalla
+            if enemy.y > self.height + 5:
+                self.enemies.remove(enemy)
+
+        # Actualizar power-ups
+        for powerup in self.powerups[:]:
+            powerup.y += 0.3
+            if powerup.y >= self.height:
+                self.powerups.remove(powerup)
+
+        # Actualizar partículas
+        for particle in self.particles[:]:
+            particle.x += particle.vx
+            particle.y += particle.vy
+            particle.vy += 0.05  # Gravedad
+            particle.life -= 1
+            if particle.life <= 0:
+                self.particles.remove(particle)
+
+        # Actualizar explosiones
+        for explosion in self.explosions[:]:
+            explosion.frame += 0.3
+            if explosion.frame >= explosion.max_frames:
+                self.explosions.remove(explosion)
+
+        # Colisiones
+        self.check_collisions()
+
+    def check_collisions(self):
+        """Verificar todas las colisiones"""
+        player_rect = (self.player.x, self.player.y, 6, 4)
+
+        # Balas del jugador vs enemigos
+        for bullet in self.bullets[:]:
+            if not bullet.friendly:
+                continue
+
+            for enemy in self.enemies[:]:
+                info = ENEMY_TYPES[enemy.type]
+                art = info['art']
+                enemy_rect = (enemy.x, enemy.y, len(art[0]), len(art))
+
+                if self.rect_collision(
+                    (bullet.x, bullet.y, 1, 1),
+                    enemy_rect
+                ):
+                    if bullet in self.bullets:
+                        self.bullets.remove(bullet)
+                    enemy.health -= bullet.damage
+
+                    if enemy.health <= 0:
+                        # Destruir enemigo
+                        self.enemies.remove(enemy)
+                        intensity = 3 if enemy.type == 'boss' else 1
+                        self.create_explosion(enemy.x + len(art[0])//2, enemy.y + len(art)//2, intensity)
+
+                        # Puntuación con combo
+                        self.combo += 1
+                        self.combo_timer = 60
+                        points = info['points'] * (1 + self.combo * 0.1)
+                        self.player.score += int(points)
+
+                        self.spawn_powerup(int(enemy.x), int(enemy.y))
+                    break
+
+        # Balas enemigas vs jugador
+        if self.player.invincible <= 0:
+            for bullet in self.bullets[:]:
+                if bullet.friendly:
+                    continue
+
+                if self.rect_collision(
+                    (bullet.x, bullet.y, 1, 1),
+                    player_rect
+                ):
+                    self.bullets.remove(bullet)
+
+                    if self.player.shield > 0:
+                        self.player.shield = 0
+                        self.create_explosion(self.player.x + 3, self.player.y + 2, 1)
+                    else:
+                        self.player_hit()
+
+        # Enemigos vs jugador
+        if self.player.invincible <= 0:
+            for enemy in self.enemies[:]:
+                info = ENEMY_TYPES[enemy.type]
+                art = info['art']
+                enemy_rect = (enemy.x, enemy.y, len(art[0]), len(art))
+
+                if self.rect_collision(player_rect, enemy_rect):
+                    if self.player.shield > 0:
+                        self.player.shield = 0
+                        enemy.health -= 5
+                        self.create_explosion(enemy.x + len(art[0])//2, enemy.y + len(art)//2, 2)
+                        if enemy.health <= 0:
+                            self.enemies.remove(enemy)
+                    else:
+                        self.player_hit()
+
+        # Power-ups vs jugador
+        for powerup in self.powerups[:]:
+            if self.rect_collision(
+                (powerup.x, powerup.y, 2, 1),
+                player_rect
+            ):
+                self.powerups.remove(powerup)
+                self.apply_powerup(powerup.type)
+
+    def rect_collision(self, r1: Tuple, r2: Tuple) -> bool:
+        """Detectar colisión entre rectángulos"""
+        x1, y1, w1, h1 = r1
+        x2, y2, w2, h2 = r2
+        return (x1 < x2 + w2 and x1 + w1 > x2 and
+                y1 < y2 + h2 and y1 + h1 > y2)
+
+    def player_hit(self):
+        """Jugador recibe daño"""
+        self.player.lives -= 1
+        self.player.invincible = 120
+        self.create_explosion(self.player.x + 3, self.player.y + 2, 2)
+
+        if self.player.lives <= 0:
+            self.game_over = True
+            if self.player.score > self.high_score:
+                self.high_score = self.player.score
+
+    def apply_powerup(self, ptype: str):
+        """Aplicar efecto de power-up"""
+        info = POWERUP_TYPES[ptype]
+
+        if ptype == 'shield':
+            self.player.shield = info['duration']
+        elif ptype == 'rapid':
+            self.player.rapid_fire = info['duration']
+        elif ptype == 'triple':
+            self.player.triple_shot = info['duration']
+        elif ptype == 'bomb':
+            # Destruir todos los enemigos en pantalla
+            for enemy in self.enemies[:]:
+                art = ENEMY_TYPES[enemy.type]['art']
+                self.create_explosion(enemy.x + len(art[0])//2, enemy.y + len(art)//2, 2)
+                self.player.score += ENEMY_TYPES[enemy.type]['points']
+            self.enemies.clear()
+        elif ptype == 'life':
+            self.player.lives = min(5, self.player.lives + 1)
+
+        # Efecto visual
+        for _ in range(20):
+            angle = random.uniform(0, math.pi * 2)
+            self.particles.append(Particle(
+                x=self.player.x + 3, y=self.player.y + 2,
+                vx=math.cos(angle) * 2,
+                vy=math.sin(angle) * 2,
+                char='✦',
+                life=20,
+                color=Colors.POWERUP.value
+            ))
+
+    def draw(self):
+        """Renderizar el juego"""
+        self.stdscr.erase()
+
+        # Efecto de sacudida
+        shake_x = random.randint(-1, 1) if self.shake_frames > 0 else 0
+        shake_y = random.randint(-1, 1) if self.shake_frames > 0 else 0
+
+        # Dibujar estrellas de fondo
+        for star in self.stars:
+            x, y = int(star.x) + shake_x, int(star.y) + shake_y
+            if 0 <= x < self.width and 0 <= y < self.height:
+                attr = curses.A_DIM if star.brightness == 1 else (
+                    curses.A_NORMAL if star.brightness == 2 else curses.A_BOLD
+                )
+                self.safe_addstr(y, x, star.char, curses.color_pair(Colors.STAR.value) | attr)
+
+        # Dibujar balas
+        for bullet in self.bullets:
+            x, y = int(bullet.x) + shake_x, int(bullet.y) + shake_y
+            if 0 <= x < self.width and 0 <= y < self.height:
+                char = '|' if bullet.friendly else '•'
+                color = Colors.BULLET.value if bullet.friendly else Colors.ENEMY.value
+                self.safe_addstr(y, x, char, curses.color_pair(color) | curses.A_BOLD)
+
+        # Dibujar power-ups
+        for powerup in self.powerups:
+            x, y = int(powerup.x) + shake_x, int(powerup.y) + shake_y
+            if 0 <= x < self.width - 1 and 0 <= y < self.height:
+                symbol = POWERUP_TYPES[powerup.type]['symbol']
+                self.safe_addstr(y, x, symbol, curses.color_pair(Colors.POWERUP.value) | curses.A_BOLD)
+
+        # Dibujar enemigos
+        for enemy in self.enemies:
+            info = ENEMY_TYPES[enemy.type]
+            color = Colors.BOSS.value if enemy.type == 'boss' else Colors.ENEMY.value
+
+            for i, line in enumerate(info['art']):
+                x, y = int(enemy.x) + shake_x, int(enemy.y) + i + shake_y
+                if 0 <= y < self.height:
+                    self.safe_addstr(y, max(0, x), line, curses.color_pair(color) | curses.A_BOLD)
+
+            # Barra de vida para boss
+            if enemy.type == 'boss':
+                max_health = info['health'] + (self.wave * 5)
+                bar_width = 20
+                filled = int((enemy.health / max_health) * bar_width)
+                bar = '█' * filled + '░' * (bar_width - filled)
+                self.safe_addstr(1, self.width // 2 - 12, f"BOSS [{bar}]",
+                               curses.color_pair(Colors.BOSS.value) | curses.A_BOLD)
+
+        # Dibujar partículas
+        for particle in self.particles:
+            x, y = int(particle.x) + shake_x, int(particle.y) + shake_y
+            if 0 <= x < self.width and 0 <= y < self.height:
+                self.safe_addstr(y, x, particle.char, curses.color_pair(particle.color))
+
+        # Dibujar explosiones
+        for explosion in self.explosions:
+            frame_idx = min(int(explosion.frame), len(EXPLOSION_FRAMES) - 1)
+            frame = EXPLOSION_FRAMES[frame_idx]
+
+            for i, line in enumerate(frame):
+                x = explosion.x - len(line) // 2 + shake_x
+                y = explosion.y - len(frame) // 2 + i + shake_y
+                if 0 <= y < self.height:
+                    self.safe_addstr(y, max(0, x), line,
+                                   curses.color_pair(Colors.EXPLOSION.value) | curses.A_BOLD)
+
+        # Dibujar jugador
+        if self.player.invincible <= 0 or self.frame % 4 < 2:
+            ship = SHIP_ART_POWERED if self.player.rapid_fire > 0 or self.player.triple_shot > 0 else SHIP_ART
+            color = Colors.POWERUP.value if self.player.shield > 0 else Colors.PLAYER.value
+
+            for i, line in enumerate(ship):
+                x, y = int(self.player.x) + shake_x, int(self.player.y) + i + shake_y
+                if 0 <= y < self.height:
+                    self.safe_addstr(y, max(0, x), line, curses.color_pair(color) | curses.A_BOLD)
+
+            # Escudo visual
+            if self.player.shield > 0:
+                shield_art = ['╭────╮', '│    │', '│    │', '╰────╯']
+                for i, line in enumerate(shield_art):
+                    x, y = int(self.player.x) - 1 + shake_x, int(self.player.y) + i + shake_y
+                    if 0 <= y < self.height:
+                        self.safe_addstr(y, max(0, x), line,
+                                       curses.color_pair(Colors.POWERUP.value) | curses.A_DIM)
+
+        # UI
+        self.draw_ui()
+
+        # Pantalla de pausa
+        if self.paused:
+            self.draw_centered_box("PAUSADO", ["Presiona P para continuar", "Q para salir"])
+
+        # Game Over
+        if self.game_over:
+            self.draw_centered_box("GAME OVER", [
+                f"Puntuación: {self.player.score}",
+                f"Mejor: {self.high_score}",
+                f"Oleada: {self.wave}",
+                "",
+                "R para reiniciar",
+                "Q para salir"
+            ])
+
+        self.stdscr.refresh()
+
+    def draw_ui(self):
+        """Dibujar interfaz de usuario"""
+        # Puntuación
+        score_text = f" SCORE: {self.player.score:08d} "
+        self.safe_addstr(0, 2, score_text, curses.color_pair(Colors.UI.value) | curses.A_BOLD)
+
+        # Combo
+        if self.combo > 1:
+            combo_text = f" x{self.combo} COMBO! "
+            self.safe_addstr(0, len(score_text) + 4, combo_text,
+                           curses.color_pair(Colors.BULLET.value) | curses.A_BOLD)
+
+        # Oleada
+        wave_text = f" WAVE: {self.wave} "
+        self.safe_addstr(0, self.width - len(wave_text) - 2, wave_text,
+                        curses.color_pair(Colors.UI.value) | curses.A_BOLD)
+
+        # Vidas
+        lives_text = " LIVES: " + "❤ " * self.player.lives
+        self.safe_addstr(self.height - 1, 2, lives_text,
+                        curses.color_pair(Colors.EXPLOSION.value) | curses.A_BOLD)
+
+        # Power-ups activos
+        powerups_active = []
+        if self.player.shield > 0:
+            powerups_active.append(f"🛡{self.player.shield // 60}")
+        if self.player.rapid_fire > 0:
+            powerups_active.append(f"⚡{self.player.rapid_fire // 60}")
+        if self.player.triple_shot > 0:
+            powerups_active.append(f"◆{self.player.triple_shot // 60}")
+
+        if powerups_active:
+            power_text = " " + " ".join(powerups_active) + " "
+            self.safe_addstr(self.height - 1, self.width - len(power_text) - 2, power_text,
+                           curses.color_pair(Colors.POWERUP.value) | curses.A_BOLD)
+
+    def draw_centered_box(self, title: str, lines: List[str]):
+        """Dibujar caja centrada con mensaje"""
+        max_width = max(len(title), max(len(l) for l in lines)) + 4
+        box_height = len(lines) + 4
+
+        start_x = (self.width - max_width) // 2
+        start_y = (self.height - box_height) // 2
+
+        # Marco
+        self.safe_addstr(start_y, start_x, "╔" + "═" * (max_width - 2) + "╗",
+                        curses.color_pair(Colors.UI.value))
+        self.safe_addstr(start_y + 1, start_x, "║" + title.center(max_width - 2) + "║",
+                        curses.color_pair(Colors.UI.value) | curses.A_BOLD)
+        self.safe_addstr(start_y + 2, start_x, "╠" + "═" * (max_width - 2) + "╣",
+                        curses.color_pair(Colors.UI.value))
+
+        for i, line in enumerate(lines):
+            self.safe_addstr(start_y + 3 + i, start_x, "║" + line.center(max_width - 2) + "║",
+                           curses.color_pair(Colors.UI.value))
+
+        self.safe_addstr(start_y + box_height - 1, start_x, "╚" + "═" * (max_width - 2) + "╝",
+                        curses.color_pair(Colors.UI.value))
+
+    def safe_addstr(self, y: int, x: int, text: str, attr=0):
+        """Añadir texto de forma segura"""
+        try:
+            if 0 <= y < self.height and 0 <= x < self.width:
+                max_len = self.width - x - 1
+                if max_len > 0:
+                    self.stdscr.addstr(y, x, text[:max_len], attr)
+        except curses.error:
+            pass
+
+    def run(self):
+        """Bucle principal del juego"""
+        # Pantalla de inicio
+        self.draw_title_screen()
+
+        while True:
+            if not self.handle_input():
+                break
+
+            self.update()
+            self.draw()
+
+            time.sleep(1/60)  # 60 FPS
+
+    def draw_title_screen(self):
+        """Pantalla de título"""
+        title = [
+            "╔═══════════════════════════════════════════════════════╗",
+            "║   ██████╗ ██████╗ ███████╗███╗   ███╗██╗ ██████╗     ║",
+            "║  ██╔════╝██╔═══██╗██╔════╝████╗ ████║██║██╔════╝     ║",
+            "║  ██║     ██║   ██║███████╗██╔████╔██║██║██║          ║",
+            "║  ██║     ██║   ██║╚════██║██║╚██╔╝██║██║██║          ║",
+            "║  ╚██████╗╚██████╔╝███████║██║ ╚═╝ ██║██║╚██████╗     ║",
+            "║   ╚═════╝ ╚═════╝ ╚══════╝╚═╝     ╚═╝╚═╝ ╚═════╝     ║",
+            "║      ██████╗ ███████╗███████╗███████╗███╗   ██╗      ║",
+            "║      ██╔══██╗██╔════╝██╔════╝██╔════╝████╗  ██║      ║",
+            "║      ██║  ██║█████╗  █████╗  █████╗  ██╔██╗ ██║      ║",
+            "║      ██║  ██║██╔══╝  ██╔══╝  ██╔══╝  ██║╚██╗██║      ║",
+            "║      ██████╔╝███████╗██║     ███████╗██║ ╚████║      ║",
+            "║      ╚═════╝ ╚══════╝╚═╝     ╚══════╝╚═╝  ╚═══╝      ║",
+            "╚═══════════════════════════════════════════════════════╝"
+        ]
+
+        controls = [
+            "",
+            "═══════════════ CONTROLES ═══════════════",
+            "",
+            "   ← → ↑ ↓  o  A W S D  :  Mover nave",
+            "        ESPACIO         :  Disparar",
+            "           P            :  Pausar",
+            "           Q            :  Salir",
+            "",
+            "═══════════════ POWER-UPS ═══════════════",
+            "",
+            "   🛡  Escudo    ⚡ Disparo rápido",
+            "   ◆  Triple    💣 Bomba    ❤  Vida",
+            "",
+            "═════════════════════════════════════════",
+            "",
+            "      Presiona ESPACIO para empezar      ",
+        ]
+
+        while True:
+            self.stdscr.erase()
+
+            # Actualizar y dibujar estrellas
+            for star in self.stars:
+                star.y += star.speed
+                if star.y >= self.height:
+                    star.y = 0
+                    star.x = random.randint(0, self.width - 1)
+
+                x, y = int(star.x), int(star.y)
+                if 0 <= x < self.width and 0 <= y < self.height:
+                    attr = curses.A_DIM if star.brightness == 1 else curses.A_NORMAL
+                    self.safe_addstr(y, x, star.char, curses.color_pair(Colors.STAR.value) | attr)
+
+            # Título
+            start_y = max(1, (self.height - len(title) - len(controls)) // 2)
+            for i, line in enumerate(title):
+                x = (self.width - len(line)) // 2
+                color = Colors.PLAYER.value if i % 2 == 0 else Colors.UI.value
+                self.safe_addstr(start_y + i, x, line, curses.color_pair(color) | curses.A_BOLD)
+
+            # Controles
+            for i, line in enumerate(controls):
+                x = (self.width - len(line)) // 2
+                self.safe_addstr(start_y + len(title) + i, x, line,
+                               curses.color_pair(Colors.UI.value))
+
+            self.stdscr.refresh()
+
+            try:
+                key = self.stdscr.getch()
+                if key == ord(' '):
+                    break
+                elif key == ord('q') or key == 27:
+                    raise KeyboardInterrupt
+            except:
+                pass
+
+            time.sleep(1/30)
+
+def main(stdscr):
+    game = Game(stdscr)
+    game.run()
+
+if __name__ == "__main__":
+    try:
+        curses.wrapper(main)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        print("\n¡Gracias por jugar COSMIC DEFENDER!")
